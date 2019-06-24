@@ -21,6 +21,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"strconv"
+	"io/ioutil"
 
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
@@ -55,6 +57,7 @@ type rbdVolume struct {
 	AdminId            string `json:"adminId"`
 	UserId             string `json:"userId"`
 	Mounter            string `json:"mounter"`
+	Encrypted          bool   `json:"encrypted"`
 }
 
 type rbdSnapshot struct {
@@ -114,6 +117,61 @@ func getMon(pOpts *rbdVolume, credentials map[string]string) (string, error) {
 	return mon, nil
 }
 
+
+func GetKey() string {
+	// Load from Kubernetes secrets / Vault?
+	token := []byte{'t', 'e', 's', 't'}
+	keyPath := "/tmp/test-key"
+	err := ioutil.WriteFile(keyPath, token, 0600)
+	if err != nil {
+		glog.V(4).Infof("Problem setting up passphrase")
+	}
+	fmt.Printf("Wrote Token in %s\n", keyPath)
+	return keyPath
+}
+
+func applyLUKS(volOptions *rbdVolume, adminId string, credentials map[string]string) error {
+	var devicePath string
+
+	passphrase := GetKey()
+
+	mapperFile := fmt.Sprintf("luks-rbd-mapper-%s", volOptions.VolName)
+
+	devicePath, err := attachRBDImageBase(volOptions, adminId, credentials)
+
+	glog.Warningf("apply LUKS (%s) ...", devicePath)
+	_, err = execCommand("cryptsetup", []string{"-q", "luksFormat", "--hash", "sha256", devicePath, "-d", passphrase})
+
+	if err != nil {
+		glog.Warningf("can't attach new rbd created image for LUKS provisioning")
+		return err
+	}
+
+	glog.Warningf("Create mapper file (%s) ...\n", mapperFile)
+	_, err = execCommand("cryptsetup", []string{"luksOpen", devicePath, mapperFile, "-d", passphrase})
+	if err != nil {
+		glog.Warningf("cryptsetup result %s", err)
+		return err
+	}
+
+	// All good. Get rid of the attached mapper and release the image for usage
+	glog.Warningf("closing luks...")
+	_, err = execCommand("cryptsetup", []string{"luksClose", fmt.Sprintf("/dev/mapper/%s", mapperFile)})
+
+	if err != nil {
+		glog.Warningf("Error Closing LUKS device %s", err)
+	}
+
+	err = detachRBDDevice(devicePath)
+	if err != nil {
+		glog.Warningf("can't detach new rbd created image for LUKS provisioning %s", err)
+		return err
+	}
+
+	return nil
+}
+
+
 // CreateImage creates a new ceph image with provision and volume options.
 func createRBDImage(pOpts *rbdVolume, volSz int, adminId string, credentials map[string]string) error {
 	var output []byte
@@ -141,10 +199,17 @@ func createRBDImage(pOpts *rbdVolume, volSz int, adminId string, credentials map
 	}
 	output, err = execCommand("rbd", args)
 
+
 	if err != nil {
-		return errors.Wrapf(err, "failed to create rbd image, command output: %s", string(output))
+		//return errors.Wrapf(err, "failed to create rbd image, command output: %s", string(output))
+		glog.Warningf("failed to create rbd image, command output: %s", string(output))
 	}
 
+	// Apply LUKS if encryption parameter is specified
+	glog.Warningf("is encrypted: %s", pOpts.Encrypted)
+	if pOpts.Encrypted {
+		err = applyLUKS(pOpts, adminId, credentials)
+	}
 	return nil
 }
 
@@ -231,6 +296,7 @@ func execCommand(command string, args []string) ([]byte, error) {
 
 func getRBDVolumeOptions(volOptions map[string]string) (*rbdVolume, error) {
 	var ok bool
+	var encrypted string
 	rbdVol := &rbdVolume{}
 	rbdVol.Pool, ok = volOptions["pool"]
 	if !ok {
@@ -274,6 +340,12 @@ func getRBDVolumeOptions(volOptions map[string]string) (*rbdVolume, error) {
 	if !ok {
 		rbdVol.Mounter = rbdDefaultMounter
 	}
+	rbdVol.Encrypted = false
+	encrypted, ok = volOptions["encrypted"]
+	if ok {
+		rbdVol.Encrypted, _ = strconv.ParseBool(encrypted)
+	}
+
 	return rbdVol, nil
 }
 

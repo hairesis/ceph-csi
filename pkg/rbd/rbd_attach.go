@@ -219,7 +219,30 @@ func checkRbdNbdTools() bool {
 	return true
 }
 
+func openLUKS(devicePath string, image string) (string, error) {
+	glog.Warningf("Opening LUKS volume on /dev/mapper/%s", image)
+	mapperFile := fmt.Sprintf("luks-rbd-%s", image)
+	_, err := execCommand("cryptsetup", []string{"luksOpen", devicePath, mapperFile, "-d", GetKey()})
+	if err != nil {
+		glog.Warningf("error applying LUKS %s", err)
+		return "", err
+	}
+	return fmt.Sprintf("/dev/mapper/%s", mapperFile), nil
+}
+
 func attachRBDImage(volOptions *rbdVolume, userId string, credentials map[string]string) (string, error) {
+	if volOptions.Encrypted {
+		devicePath, err := attachRBDImageBase(volOptions, userId, credentials)
+		if err != nil {
+			glog.Warningf("error attaching rbd image")
+			return "", err
+		}
+		return openLUKS(devicePath, volOptions.VolName)
+	}
+	return attachRBDImageBase(volOptions, userId, credentials)
+}
+
+func attachRBDImageBase(volOptions *rbdVolume, userId string, credentials map[string]string) (string, error) {
 	var err error
 	var output []byte
 
@@ -288,7 +311,7 @@ func attachRBDImage(volOptions *rbdVolume, userId string, credentials map[string
 		}
 	}
 
-	return devicePath, nil
+	return devicePath, err
 }
 
 func detachRBDDevice(devicePath string) error {
